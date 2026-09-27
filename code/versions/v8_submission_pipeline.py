@@ -1,0 +1,289 @@
+import pandas as pd
+import re
+import unicodedata
+import gc
+import heapq
+import time
+import os
+import psutil
+import concurrent.futures
+
+from collections import Counter, defaultdict
+from rapidfuzz import fuzz
+
+# =========================================================
+# SETTINGS
+# =========================================================
+CHUNK_SIZE = 200_000
+GRAM_MAX_FREQ = 5000
+MAX_CANDIDATES = 200
+MATCH_THRESHOLD = 0.86
+NAME_WEIGHT = 0.40
+ADDRESS_WEIGHT = 0.60
+WORKERS = os.cpu_count() or 4
+
+def get_ram_gb():
+    return psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
+
+# =========================================================
+# 1. NORMALIZATION & GRAMS
+# =========================================================
+LEGAL_SUFFIX_MAP = {
+    "pvt": "private", "private": "private", "ltd": "limited", "limited": "limited",
+    "corp": "corporation", "corporation": "corporation", "inc": "incorporated", 
+    "incorporated": "incorporated", "co": "company", "company": "company",
+    "llc": "llc", "llp": "llp", "plc": "plc", "lp": "lp"
+}
+LEGAL_SUFFIXES = set(LEGAL_SUFFIX_MAP.values())
+
+ADDRESS_MAP = {
+    "rd": "road", "road": "road", "st": "street", "street": "street", "ave": "avenue", 
+    "av": "avenue", "avenue": "avenue", "dr": "drive", "drive": "drive", "ln": "lane", 
+    "lane": "lane", "blvd": "boulevard", "boulevard": "boulevard", "hwy": "highway", 
+    "highway": "highway", "pkwy": "parkway", "parkway": "parkway", "ct": "court", 
+    "court": "court", "cir": "circle", "circle": "circle", "pl": "place", "place": "place", 
+    "ter": "terrace", "terrace": "terrace", "trl": "trail", "trail": "trail", 
+    "apt": "apartment", "appt": "apartment", "apartment": "apartment", "fl": "floor", 
+    "floor": "floor", "rm": "room", "room": "room", "ste": "suite", "suite": "suite", 
+    "bldg": "building", "building": "building", "no": "number", "num": "number", "number": "number"
+}
+
+def normalize_text(x):
+    if pd.isna(x): return ""
+    x = str(x).casefold()
+    x = unicodedata.normalize("NFKD", x)
+    x = "".join(c for c in x if not unicodedata.combining(c))
+    x = "".join(" " if unicodedata.category(c).startswith("P") else c for c in x)
+    return " ".join(x.split())
+
+def tokens(x): return set(re.findall(r"\w+", x)) if x else set()
+
+def strong_name_core(x):
+    x = normalize_text(x)
+    if not x: return ""
+    norm = " ".join(LEGAL_SUFFIX_MAP.get(t, t) for t in x.split())
+    return " ".join(sorted(set(norm.split()) - LEGAL_SUFFIXES))
+
+def strong_address(x):
+    x = normalize_text(x)
+    if not x: return ""
+    return " ".join(sorted({ADDRESS_MAP.get(t, t) for t in x.split()}))
+
+def char3grams(x):
+    compact = "".join(c for c in x if c.isalnum()) if x else ""
+    if len(compact) < 3: return set()
+    return {compact[i:i + 3] for i in range(len(compact) - 2)}
+
+
+# =========================================================
+# PIPELINE EXECUTION (TEST SET)
+# =========================================================
+if __name__ == "__main__":
+    total_start = time.time()
+    
+    # ---------------------------------------------------------
+    # LOAD TEST S1
+    # ---------------------------------------------------------
+    t0 = time.time()
+    print(f"[{get_ram_gb():.2f} GB] Loading Full S1 Test Set...")
+    
+    s1 = pd.read_csv("dataset/test/test_source1.tsv", sep="\t", usecols=["entity_id", "business_name", "business_address", "country"])
+    
+    s1_map = {}
+    s1_ids_list = []
+    
+    for i, row in enumerate(s1.itertuples(index=False)):
+        old_name, old_address = normalize_text(row.business_name), normalize_text(row.business_address)
+        core_name, strong_addr = strong_name_core(row.business_name), strong_address(row.business_address)
+        
+        s1_map[row.entity_id] = {
+            "index": i, "country": row.country, "old_name": old_name, "old_address": old_address,
+            "old_name_tokens": tokens(old_name), "old_address_tokens": tokens(old_address),
+            "core_name": core_name, "strong_address": strong_addr,
+            "name_grams": char3grams(core_name), "address_grams": char3grams(strong_addr),
+        }
+        s1_ids_list.append(row.entity_id)
+        
+    del s1; gc.collect()
+    print(f"  -> Processed {len(s1_ids_list):,} S1 rows. Time: {time.time() - t0:.2f}s")
+
+    # ---------------------------------------------------------
+    # PASS 1: TOKEN & GRAM COUNTS
+    # ---------------------------------------------------------
+    t0 = time.time()
+    print(f"\n[{get_ram_gb():.2f} GB] PASS 1: Counting Test Tokens & Grams...")
+    name_counts, address_counts = defaultdict(Counter), defaultdict(Counter)
+    name_gram_counts, address_gram_counts = defaultdict(Counter), defaultdict(Counter)
+
+    def count_stats(path):
+        for chunk in pd.read_csv(path, sep="\t", usecols=["business_name", "business_address", "country"], chunksize=CHUNK_SIZE):
+            for row in chunk.itertuples(index=False):
+                country = row.country
+                for t in tokens(normalize_text(row.business_name)): name_counts[country][t] += 1
+                for t in tokens(normalize_text(row.business_address)): address_counts[country][t] += 1
+                for g in char3grams(strong_name_core(row.business_name)): name_gram_counts[country][g] += 1
+                for g in char3grams(strong_address(row.business_address)): address_gram_counts[country][g] += 1
+            gc.collect()
+
+    count_stats("dataset/test/test_source2.tsv")
+    count_stats("dataset/test/test_source3.tsv")
+
+    exact_name_lookup, core_name_lookup, strong_address_lookup = defaultdict(list), defaultdict(list), defaultdict(list)
+    rare_name_token_lookup, rare_address_token_lookup = defaultdict(list), defaultdict(list)
+    name_gram_lookup, address_gram_lookup = defaultdict(list), defaultdict(list)
+
+    for sid, row in s1_map.items():
+        country, idx = row["country"], row["index"]
+        if row["old_name"]: exact_name_lookup[(country, row["old_name"])].append(idx)
+        if row["core_name"]: core_name_lookup[(country, row["core_name"])].append(idx)
+        if row["strong_address"]: strong_address_lookup[(country, row["strong_address"])].append(idx)
+        
+        for t in row["old_name_tokens"]:
+            if 0 < name_counts[country].get(t, 0) <= 100: rare_name_token_lookup[(country, t)].append(idx)
+        for t in row["old_address_tokens"]:
+            if 0 < address_counts[country].get(t, 0) <= 100: rare_address_token_lookup[(country, t)].append(idx)
+            
+        n_cands = [(name_gram_counts[country].get(g, 0), g) for g in row["name_grams"] if 0 < name_gram_counts[country].get(g, 0) <= GRAM_MAX_FREQ]
+        if n_cands: name_gram_lookup[(country, sorted(n_cands)[0][1])].append(idx)
+        
+        a_cands = [(address_gram_counts[country].get(g, 0), g) for g in row["address_grams"] if 0 < address_gram_counts[country].get(g, 0) <= GRAM_MAX_FREQ]
+        if a_cands: address_gram_lookup[(country, sorted(a_cands)[0][1])].append(idx)
+    print(f"  -> Pass 1 time: {time.time() - t0:.2f}s")
+
+    # ---------------------------------------------------------
+    # PASS 2: BLOCKING CANDIDATE GENERATION (VIRTUAL INTEGERS)
+    # ---------------------------------------------------------
+    t0 = time.time()
+    print(f"\n[{get_ram_gb():.2f} GB] PASS 2: Generating Top-200 Candidates by Blocking Score...")
+    heaps = [[] for _ in range(len(s1_map))]
+    global_row_counter = 0
+
+    def process_blocking(path):
+        global global_row_counter
+        processed_targets = 0
+        for chunk in pd.read_csv(path, sep="\t", usecols=["business_name", "business_address", "country"], chunksize=CHUNK_SIZE):
+            for row in chunk.itertuples(index=False):
+                country, tid_int = row.country, global_row_counter
+                global_row_counter += 1
+                processed_targets += 1
+                
+                old_name, old_addr = normalize_text(row.business_name), normalize_text(row.business_address)
+                core_name, strong_addr = strong_name_core(row.business_name), strong_address(row.business_address)
+                
+                scores = {}
+                def touch(idx, amt): scores[idx] = scores.get(idx, 0.0) + amt
+                
+                for idx in exact_name_lookup.get((country, old_name), []): touch(idx, 100.0)
+                for idx in core_name_lookup.get((country, core_name), []): touch(idx, 80.0)
+                for idx in strong_address_lookup.get((country, strong_addr), []): touch(idx, 60.0)
+                
+                for t in tokens(old_name):
+                    f = name_counts[country].get(t, 0)
+                    if 0 < f <= 100:
+                        w = 15.0 / (1.0 + f**0.5)
+                        for idx in rare_name_token_lookup.get((country, t), []): touch(idx, w)
+                for t in tokens(old_addr):
+                    f = address_counts[country].get(t, 0)
+                    if 0 < f <= 100:
+                        w = 20.0 / (1.0 + f**0.5)
+                        for idx in rare_address_token_lookup.get((country, t), []): touch(idx, w)
+                for g in char3grams(core_name):
+                    f = name_gram_counts[country].get(g, 0)
+                    if 0 < f <= GRAM_MAX_FREQ:
+                        w = 40.0 / (1.0 + f**0.5)
+                        for idx in name_gram_lookup.get((country, g), []): touch(idx, w)
+                for g in char3grams(strong_addr):
+                    f = address_gram_counts[country].get(g, 0)
+                    if 0 < f <= GRAM_MAX_FREQ:
+                        w = 50.0 / (1.0 + f**0.5)
+                        for idx in address_gram_lookup.get((country, g), []): touch(idx, w)
+                
+                for idx, score in scores.items():
+                    heap = heaps[idx]
+                    if len(heap) < MAX_CANDIDATES: heapq.heappush(heap, (score, tid_int))
+                    elif score > heap[0][0]: heapq.heapreplace(heap, (score, tid_int))
+            gc.collect()
+            if processed_targets % 1_000_000 == 0:
+                print(f"    Scanned {processed_targets:,} target rows...")
+
+    process_blocking("dataset/test/test_source2.tsv")
+    process_blocking("dataset/test/test_source3.tsv")
+    print(f"  -> Pass 2 time: {time.time() - t0:.2f}s")
+
+    # ---------------------------------------------------------
+    # PASS 3: FETCH RETAINED STRINGS
+    # ---------------------------------------------------------
+    t0 = time.time()
+    print(f"\n[{get_ram_gb():.2f} GB] PASS 3: Extracting Target Strings...")
+    unique_retained_ints = set()
+    for heap in heaps: unique_retained_ints.update([tid_int for _, tid_int in heap])
+
+    retained_strings = {}
+    retained_original_ids = {}
+    global_row_counter = 0
+
+    def fetch_strings(path):
+        global global_row_counter
+        for chunk in pd.read_csv(path, sep="\t", usecols=["entity_id", "business_name", "business_address"], chunksize=CHUNK_SIZE):
+            for row in chunk.itertuples(index=False):
+                if global_row_counter in unique_retained_ints:
+                    retained_strings[global_row_counter] = (normalize_text(row.business_name), normalize_text(row.business_address))
+                    retained_original_ids[global_row_counter] = row.entity_id
+                global_row_counter += 1
+            gc.collect()
+
+    fetch_strings("dataset/test/test_source2.tsv")
+    fetch_strings("dataset/test/test_source3.tsv")
+    print(f"  -> Pass 3 time: {time.time() - t0:.2f}s")
+
+    # ---------------------------------------------------------
+    # STAGE 2: MULTITHREADED FUZZY EVALUATION & EXPORT
+    # ---------------------------------------------------------
+    t0 = time.time()
+    print(f"\n[{get_ram_gb():.2f} GB] STAGE 2: Fuzzy Matching & Exporting via {WORKERS} Thread Workers...")
+
+    os.makedirs("output", exist_ok=True)
+    
+    def evaluate_s1(idx):
+        sid = s1_ids_list[idx]
+        heap = heaps[idx]
+        selected = sorted(heap, reverse=True) # Sort highest blocking score first
+        
+        all_candidate_ids = []
+        matched_ids = []
+        
+        for _, tid_int in selected:
+            tgt_name, tgt_addr = retained_strings.get(tid_int, ("", ""))
+            original_tid = retained_original_ids.get(tid_int, "")
+            
+            all_candidate_ids.append(original_tid)
+            
+            n_score = fuzz.token_set_ratio(s1_map[sid]["old_name"], tgt_name) / 100.0
+            a_score = fuzz.token_set_ratio(s1_map[sid]["old_address"], tgt_addr) / 100.0
+            match_score = (NAME_WEIGHT * n_score) + (ADDRESS_WEIGHT * a_score)
+            
+            if match_score >= MATCH_THRESHOLD:
+                matched_ids.append(original_tid)
+                
+        return sid, all_candidate_ids, matched_ids
+
+    # Write incrementally to save memory at the final step
+    with open("output/candidate_pairs_v8.tsv", "w", encoding="utf-8") as f_cand, \
+         open("output/matching_results_v8.tsv", "w", encoding="utf-8") as f_match:
+         
+        f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
+        f_match.write("source1_entity_id\tmatched_entity_ids\n")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            # chunksize=1000 maintains high thread efficiency without RAM bloat
+            for sid, cands, matches in executor.map(evaluate_s1, range(len(s1_ids_list)), chunksize=1000):
+                f_cand.write(f"{sid}\t{','.join(cands)}\n")
+                f_match.write(f"{sid}\t{','.join(matches)}\n")
+
+    print(f"  -> Export complete. Time: {time.time() - t0:.2f}s")
+    
+    runtime_hrs = (time.time() - total_start) / 3600
+    print(f"\n=================================================")
+    print(f"FULL PIPELINE COMPLETE | Peak RAM: {get_ram_gb():.2f} GB | Runtime: {runtime_hrs:.2f} hrs")
+    print(f"Check /output/ for candidate_pairs_v8.tsv and matching_results_v8.tsv")
+    print(f"=================================================")
